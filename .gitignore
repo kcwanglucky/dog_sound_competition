@@ -1,3 +1,14 @@
 public_test/
 
 train/
+
+*.csv
+
+.DS_Store
+
+*.pyo
+*.pyc
+
+model/
+
+ReportTemplate及資料集上傳格式說明/

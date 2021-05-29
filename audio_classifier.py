@@ -12,8 +12,10 @@ from IPython.display import Audio, display
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import random_split
 
+from datetime import datetime
+
 from utils import *
-from config import path_config
+from config import path_config, label_mapping
 
 class AudioProcessor:
     """ Preprocess audio files """
@@ -35,7 +37,7 @@ class AudioProcessor:
 class AudioDataset(Dataset):
     """Face Landmarks dataset."""
 
-    def __init__(self, path_prefix, files, y):
+    def __init__(self, path_prefix, files, train=True, y=None):
         """
         Args:
             csv_file (string): Path to the csv file with annotations.
@@ -44,25 +46,26 @@ class AudioDataset(Dataset):
         """
         self.path_prefix = path_prefix
         self.files = files
+        self.train = train
         self.y = y
 
     def __len__(self):
-        return len(self.y)
+        return len(self.files)
 
     def __getitem__(self, idx):
         filename = self.files[idx]
         filepath = os.path.join(self.path_prefix, filename)
         
         waveform, sample_rate = AudioProcessor.read(filepath)
-        
         specgram = AudioProcessor.spectro_gram(waveform, sample_rate, n_mels=64, n_fft=1024, hop_len=None)
         
-        # TODO: Need to support using "Remark" as well
-        y = self.y[self.y["Filename"] == filename.split('.')[0]]["Label"].to_numpy()
-        
-        sample = {'x': specgram, 'y': y}
-
-        return sample
+        if self.train:
+            # TODO: Need to support using "Remark" as well
+            y = self.y[self.y["Filename"] == filename.split('.')[0]]["Label"].to_numpy()
+            sample = {"x": specgram, "y": y}
+            return sample
+        else:   # testset
+            return {"x": specgram, "filename": filename.split('.')[0]}
 
 class AudioClassifier(nn.Module):
     def __init__(self, num_class):
@@ -198,7 +201,9 @@ def train(data, num_class):
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     num_epochs = 15
 
-    training_loop(train_dl, val_dl, model, loss_fnc, optimizer, num_epochs)
+    model = training_loop(train_dl, val_dl, model, loss_fnc, optimizer, num_epochs)
+
+    return model
 
 def training_loop(train_dl, val_dl, model, loss_fn, optimizer, num_epochs):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -243,13 +248,12 @@ def training_loop(train_dl, val_dl, model, loss_fn, optimizer, num_epochs):
             total_prediction += y_pred.shape[0]
 
             if i % 10 == 0:    # print every 10 mini-batches
-                oh_ytrue = torch.nn.functional.one_hot(y_true)
-                y_prob = torch.nn.functional.softmax(outputs, dim=1).detach().numpy()
-                auc = roc_auc_score(oh_ytrue, y_prob, multi_class="ovr")
+                # oh_ytrue = torch.nn.functional.one_hot(y_true)
+                # y_prob = torch.nn.functional.softmax(outputs, dim=1).detach().numpy()
+                # auc = roc_auc_score(oh_ytrue, y_prob, multi_class="ovr")
+
                 print("Epoch {} Batch {} Result".format(epoch + 1, i + 1))
                 print('\tLoss: %.3f' % (running_loss / (i + 1)))
-
-        val_acc, val_avg_loss, val_auc = validation_loop(val_dl, model, loss_fn)
 
         # Print stats at the end of the epoch
         num_batches = len(train_dl)
@@ -260,21 +264,31 @@ def training_loop(train_dl, val_dl, model, loss_fn, optimizer, num_epochs):
         print("Train Stats:")
         print(f'\tLoss: {avg_loss:.2f}, Accuracy: {acc:.2f}')
 
+        val_ret = validation_loop(val_dl, model, val=True, loss_fn=loss_fn)
         print("Validation Stats:")
-        print(f'\tLoss: {val_avg_loss:.2f}, Accuracy: {val_acc:.2f}, Auc: {val_auc:.2f}')
+        print(f'\tLoss: {val_ret["loss"]:.2f}, Accuracy: {val_ret["acc"]:.2f}, Auc: {val_ret["auc"]:.2f}')
 
     print('Finished Training')
 
-def validation_loop(val_dl, model, loss_fn):
+    return model
+
+def validation_loop(val_dl, model, val=True, loss_fn=None):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     size = len(val_dl.dataset)
 
     val_loss = correct_prediction = total_prediction = 0
     y_true_all, y_pred_all, y_prob_all = [], [], []
+    filenames = []
 
     with torch.no_grad():
         for i, data in enumerate(val_dl):
-            x, y_true = data['x'].to(device), data['y'].to(device).reshape(-1)
+            if i % 100 == 0:
+                print("batch {}".format(i))
+            if val:
+                x, y_true = data['x'].to(device), data['y'].to(device).reshape(-1)
+            else:
+                x = data['x'].to(device)
+                filenames.extend(data['filename'])
 
             # Normalize the inputs
             mean, std = x.mean(), x.std()
@@ -284,52 +298,87 @@ def validation_loop(val_dl, model, loss_fn):
             outputs = model(x)
             y_prob = torch.nn.functional.softmax(outputs, dim=1)
 
-            val_loss += loss_fn(outputs, y_true).item()
-
             # Get the predicted class with the highest score
             _, y_pred = torch.max(outputs, 1)
 
-            # Count of predictions that matched the target label
-            correct_prediction += (y_pred == y_true).sum().item()
-            total_prediction += y_pred.shape[0]
-
-            y_true_all.append(y_true.cpu())
-            y_pred_all.append(y_pred.cpu())
             y_prob_all.append(y_prob.cpu())
 
-    acc = correct_prediction/total_prediction
+            if val:
+                val_loss += loss_fn(outputs, y_true).item()
+
+                # Count of predictions that matched the target label
+                correct_prediction += (y_pred == y_true).sum().item()
+                total_prediction += y_pred.shape[0]
+                y_true_all.append(y_true.cpu())
+
+            else:
+                y_pred_all.append(y_pred.cpu())
     
     # oh_ytrue = torch.nn.functional.one_hot(y_true)
     # y_prob = torch.nn.functional.softmax(outputs, dim=1).detach().numpy()
     # auc = roc_auc_score(oh_ytrue, y_prob, multi_class="ovr")
 
     # y_prob = torch.nn.functional.softmax(outputs, dim=1)
-    y_true_all = torch.cat(y_true_all, dim = 0).detach().cpu().numpy()
-    y_pred_all = torch.cat(y_pred_all, dim = 0).detach().cpu().numpy()
     y_prob_all = torch.cat(y_prob_all, dim = 0).detach().cpu().numpy()
-
-    auc = roc_auc_score(y_true_all, y_prob_all, multi_class="ovr")
-
-    return acc, val_loss / size, auc
+    if val:
+        acc = correct_prediction/total_prediction
+        y_true_all = torch.cat(y_true_all, dim = 0).detach().cpu().numpy()
+        
+        auc = roc_auc_score(y_true_all, y_prob_all, multi_class="ovr")
+        return {"acc": acc, "loss": val_loss / size, "auc": auc}
+    else:
+        y_pred_all = torch.cat(y_pred_all, dim = 0).detach().cpu().numpy()
+        return {"pred": y_pred_all, "prob": y_prob_all, "filenames": filenames}
 
 def main():
-    train_audio_path = path_config["train_audio_path"]
-    metadata = pd.read_csv("./train/meta_train.csv")
+    # train_audio_path = path_config["train_audio_path"]
+    # metadata = pd.read_csv("./train/meta_train.csv")
 
-    x_summary = explore_x(train_audio_path)
-    y_summary = explore_y(metadata)
+    # x_summary = explore_x(train_audio_path)
+    # y_summary = explore_y(metadata)
 
-    data = data_cleaning(train_audio_path, x_summary["waveform_shape"], metadata)
+    # data = data_cleaning(train_audio_path, x_summary["waveform_shape"], metadata)
 
-    audio_dataset = AudioDataset(train_audio_path, data["x_file_paths"], data["y"])
-    # print(audio_dataset[500])
+    # audio_dataset = AudioDataset(train_audio_path, data["x_file_paths"], train=True, y=data["y"])
+    # # print(audio_dataset[500])
 
-    data = data_split(audio_dataset)
+    # data = data_split(audio_dataset)
 
-    # check_shape(data["train_dataloader"])
+    # # check_shape(data["train_dataloader"])
+    # model = train(data, len(y_summary["label"]))
 
-    train(data, len(y_summary["label"]))
+    # model_name = datetime.now().strftime('%m%d%H%M') + ".pt" 
+    # torch.save(model.state_dict(), os.path.join("model", model_name))
 
+    # Load Model
+    # model = AudioClassifier(6)
+    # model.load_state_dict(torch.load("model/05292344.pt"))
+    # model.eval()
+
+    # test_audio_path = path_config["test_audio_path"]
+    
+    # test_files = os.listdir(test_audio_path)
+    # test_ds = AudioDataset(test_audio_path, test_files, train=False)
+    # test_dl = DataLoader(test_ds, batch_size=128, shuffle=False, num_workers=0)
+
+    # test_ret = validation_loop(test_dl, model, val=False)
+
+    # y_prob_all = test_ret["prob"]
+    # filenames = np.array([test_ret["filenames"]])
+
+    # # print("filenames: {}".format(filenames))
+    # # print("prob: {}".format(y_prob_all))
+    
+    # col_name = ["Filename", "Barking", "Howling", "Crying", "COSmoke", "GlassBreaking", "Other"]
+
+    # output = np.concatenate((filenames.T, y_prob_all), axis=1)
+    # output = pd.DataFrame(output, columns=col_name)
+
+    output = pd.read_csv("prediction1.csv")
+    sample = pd.read_csv("sample_submission.csv")
+    output = output.append(sample.iloc[10000:], ignore_index=True)
+    output.to_csv("prediction.csv", index=False)
+    
 
 
 if __name__ == "__main__":
