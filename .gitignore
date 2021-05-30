@@ -2,7 +2,11 @@ public_test/
 
 train/
 
-*.csv
+pred/
+
+__pycache__/
+
+logging/
 
 .DS_Store
 
