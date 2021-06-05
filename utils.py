@@ -5,6 +5,7 @@ import os
 import math
 import tarfile
 import multiprocessing
+import shutil
 
 import torch
 # import librosa
@@ -171,3 +172,16 @@ def plot_kaldi_pitch(waveform, sample_rate, pitch, nfcc):
     labels = [l.get_label() for l in lns]
     axis.legend(lns, labels, loc=0)
     plt.show(block=False)
+
+def delete_result(time):
+    """ delete the model, pred, and logging that corresponds to particular `time` """
+    if os.path.exists(os.path.join("model", time)):
+        shutil.rmtree(os.path.join("model", time))
+    if os.path.exists(os.path.join("pred", time)):
+        shutil.rmtree(os.path.join("pred", time))
+    if os.path.exists(os.path.join("logging", time)):
+        shutil.rmtree(os.path.join("logging", time))
+
+if __name__ == "__main__":
+    # pass
+    delete_result("06011529")

@@ -6,114 +6,20 @@ import torch
 from torch import nn
 import logging
 
-import torchaudio
-from torchaudio import transforms
-from torch.utils.data import Dataset, DataLoader, dataset
+from torch.utils.data import DataLoader, dataset
 from IPython.display import Audio, display
+from torchsummary import summary
 
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, confusion_matrix
 from torch.utils.data import random_split
 
 from datetime import datetime
 
 from utils import *
-from config import configs
+from model import AudioClassifier
+from audio_util import AudioDataset, AudioProcessor
+from config import configs, get_configs, remark2idx
 from pprint import pformat
-
-class AudioProcessor:
-    """ Preprocess audio files """
-    def read(audio_file):
-        """Load an audio file. Return the signal as a tensor and the sample rate"""
-        waveform, sample_rate = torchaudio.load(audio_file)
-        return (waveform, sample_rate) #if waveform.shape == self.shape else None
-    
-    def spectro_gram(waveform, sample_rate, n_mels=64, n_fft=1024, hop_len=None):
-        top_db = 80
-
-        # spec has shape [channel, n_mels, time], where channel is mono, stereo etc
-        spec = transforms.MelSpectrogram(sample_rate, n_fft=n_fft, hop_length=hop_len, n_mels=n_mels)(waveform)
-
-        # Convert to decibels
-        spec = transforms.AmplitudeToDB(top_db=top_db)(spec)
-        return (spec)
-
-class AudioDataset(Dataset):
-    """Face Landmarks dataset."""
-
-    def __init__(self, dir_name, filenames, y=None, label_name=None):
-        """
-        Args:
-            csv_file (string): Path to the csv file with annotations.
-            transform (callable, optional): Optional transform to be applied
-                on a sample.
-        """
-        self.dir_name = dir_name
-        self.filenames = filenames
-        self.is_test = y is None
-        self.y = y
-        self.label_name = label_name
-
-    def __len__(self):
-        return len(self.filenames)
-
-    def __getitem__(self, idx):
-        """
-        Return `x` and `y` for train and validation dataset; `x` and `filename` otherwise
-        """
-        filename = self.filenames[idx]
-        filepath = os.path.join(self.dir_name, filename)
-        
-        waveform, sample_rate = AudioProcessor.read(filepath)
-        specgram = AudioProcessor.spectro_gram(waveform, sample_rate, n_mels=64, n_fft=1024, hop_len=None)
-        
-        if not self.is_test:        # Train or val set
-            y = self.y[self.y["Filename"] == filename.split('.')[0]][self.label_name].to_numpy()
-            sample = {"x": specgram, "y": y}
-            return sample
-        else:                       # Test set
-            return {"x": specgram, "filename": filename.split('.')[0]}
-
-class AudioClassifier(nn.Module):
-    def __init__(self, num_class):
-        super().__init__()
-        conv_layers = []
-
-        # First Convolution Block with Relu and Batch Norm. Use Kaiming Initialization
-        self.conv1 = nn.Conv2d(1, 8, kernel_size=(5, 5), stride=(2, 2), padding=(2, 2))
-        self.relu1 = nn.ReLU()
-        self.bn1 = nn.BatchNorm2d(8)
-        torch.nn.init.kaiming_normal_(self.conv1.weight, a=0.1)
-        self.conv1.bias.data.zero_()
-        conv_layers += [self.conv1, self.relu1, self.bn1]
-
-        # Second Convolution Block
-        self.conv2 = nn.Conv2d(8, 16, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))
-        self.relu2 = nn.ReLU()
-        self.bn2 = nn.BatchNorm2d(16)
-        torch.nn.init.kaiming_normal_(self.conv2.weight, a=0.1)
-        self.conv2.bias.data.zero_()
-        conv_layers += [self.conv2, self.relu2, self.bn2]
-
-        # Wrap the Convolutional Blocks
-        self.conv = nn.Sequential(*conv_layers)
-        
-        # Linear Classifier
-        self.pooling = nn.AdaptiveAvgPool2d(output_size=1)
-        self.linear = nn.Linear(in_features=16, out_features=num_class)
-
-    def forward(self, x):
-        # Run the convolutional blocks
-        x = self.conv(x)
-
-        # Adaptive pool and flatten for input to linear layer
-        x = self.pooling(x)
-        x = x.view(x.shape[0], -1)
-
-        # Linear layer
-        x = self.linear(x)
-
-        # Final output
-        return x
 
 def explore_y(metadata, run_eda):
     """ Show the number of class. Two labelling schemes available """
@@ -130,7 +36,7 @@ def explore_y(metadata, run_eda):
         logging.info("remark list: {}".format(remark))
         logging.info("remark distribution:\n{}\n".format(metadata["Remark"].value_counts()))
 
-    return {"metadata": metadata, "label": label, "remark": remark}
+    return {"metadata": metadata, "Label": label, "Remark_label": remark}
 
 def explore_x(path_to_train_dir):
     files = os.listdir(path_to_train_dir)
@@ -147,32 +53,50 @@ def data_cleaning(path_to_train_dir, shape, metadata):
     logging.info("Normal shape: {}\n".format(shape))
 
     num_files_bf = len(files)
-    to_remove = []  # collect samples whose shape is different from input `shape`
+    to_remove = set()  # collect samples whose shape is different from input `shape`
     count = 0
+
+    other_files = [f + ".wav" for f in metadata[metadata["Remark"] == "Other"]["Filename"].values]
+
+    for path in other_files:
+        to_remove.add(path)
+        count += 1
+
     for path in files:
         # print(os.path.join(TRAIN_AUDIO_PATH, path))
         waveform, sample_rate = AudioProcessor.read(os.path.join(path_to_train_dir, path))
         if waveform.shape != shape:
-            to_remove.append(path)
+            to_remove.add(path)
             count += 1
             logging.info("Anomaly Shape Detected: {}\nShape: {}\n".format(path, waveform.shape))
+
+        """ To remove Label 4, 5, 6 so that I could train a model for label 1, 2, 3"""
+        #TODO: Make it flexible
+        if metadata[metadata["Filename"] == path.split('.')[0]]["Label"].values[0] not in (1, 2):
+            if path not in to_remove:
+                to_remove.add(path)
 
     for file in to_remove:
         drop_idx = metadata[metadata["Filename"] == file.split('.')[0]].index
         metadata = metadata.drop(drop_idx)
         files.remove(file)
-        
+
+    #TODO: Make it flexible
+    metadata = metadata.loc[metadata['Label'].isin([1, 2])]
+    metadata["Label"] = metadata["Label"] - 1
+    
+    assert len(metadata) == len(files)
     logging.info("Total Anomaly: {}".format(count))
     logging.info("Before deleting anomaly: {} numbers of audios".format(num_files_bf))
     logging.info("After deleting anomaly: {} numbers of audios\n".format(len(files)))
 
-    assert len(files) == len(metadata)
+    # assert len(files) == len(metadata)
     logging.info("Number of valid sample x: {}".format(len(files)))
     logging.info("Number of valid sample y: {}\n".format(len(metadata)))
 
     return {"x_file_paths": files, "y": metadata}
 
-def data_split(dataset, config):
+def to_dataloader(dataset, config):
     num_items = len(dataset)
     num_train = round(num_items * config["train_perc"])
     num_val = num_items - num_train
@@ -183,24 +107,28 @@ def data_split(dataset, config):
 
     val_dataloader = DataLoader(val_ds, batch_size=config["val_batch_size"],
                         shuffle=False, num_workers=0)
-
-    return {"train_ds": train_ds, "val_ds": val_ds, "train_dl": train_dataloader, "val_dl": val_dataloader}
+    
+    check_shape(train_dataloader)
+    return {"dataset": dataset, "train_ds": train_ds, "val_ds": val_ds, "train_dl": train_dataloader, "val_dl": val_dataloader}
 
 def check_shape(dataloader):
     for i_batch, sample_batched in enumerate(dataloader):
-        print("x_size: {} \ty_size: {}\n".format(
+        logging.info("Data Shape")
+        logging.info("x_size: {} \ty_size: {}\n".format(
             sample_batched['x'].size(), sample_batched['y'].size()))
         if i_batch == 1:
             break
 
-def train(data, num_class, config):
+def train(data, config):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     logging.info('Using {} device\n'.format(device))
 
-    train_ds, val_ds = data["train_ds"], data["val_ds"]
+    num_class = len(data["dataset"].y[configs["label_config"]["label_name"]].unique())
+    print(num_class)
     train_dl, val_dl = data["train_dl"], data["val_dl"]
 
-    model = AudioClassifier(num_class = num_class)
+    model_config = config["model_config"]
+    model = AudioClassifier(num_class, model_config)
     device = torch.device(device)
     model = model.to(device)
 
@@ -212,19 +140,22 @@ def train(data, num_class, config):
                                                 epochs=config["num_epochs"],
                                                 anneal_strategy='linear')
 
-    model = training_loop(train_dl, val_dl, model, loss_fnc, optimizer, scheduler, config["num_epochs"], config["show_plot"])
+    model, result = training_loop(train_dl, val_dl, model, loss_fnc, optimizer, scheduler, config["num_epochs"])
 
-    return model
+    return model, result
 
-def training_loop(train_dl, val_dl, model, loss_fn, optimizer, scheduler, num_epochs, show_plot=False):
+def training_loop(train_dl, val_dl, model, loss_fn, optimizer, scheduler, num_epochs):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    all_train_loss, all_train_acc, all_val_loss, all_val_acc, all_val_auc = [], [], [], [], []
+    all_train_loss, all_train_acc, all_train_auc, all_val_loss, all_val_acc, all_val_auc = [], [],[], [], [], []
+
     # Repeat for each epoch
     for epoch in range(num_epochs):
         running_loss = 0.0
         correct_prediction = 0
         total_prediction = 0
+
+        y_true_all, y_prob_all = [], []
 
         # Repeat for each batch in the training set
         for i, data in enumerate(train_dl):
@@ -236,6 +167,8 @@ def training_loop(train_dl, val_dl, model, loss_fn, optimizer, scheduler, num_ep
 
             # forward + backward + optimize
             outputs = model(x)
+            y_prob = torch.nn.functional.softmax(outputs, dim=1)
+
             loss = loss_fn(outputs, y_true)
 
             # Backpropagation
@@ -260,8 +193,11 @@ def training_loop(train_dl, val_dl, model, loss_fn, optimizer, scheduler, num_ep
                 # y_prob = torch.nn.functional.softmax(outputs, dim=1).detach().numpy()
                 # auc = roc_auc_score(oh_ytrue, y_prob, multi_class="ovr", average='weighted')
 
-                logging.info("Epoch {} Batch {}:".format(epoch + 1, i + 1))
-                logging.info('\tLoss/Sample: %.3f' % (loss.item()))
+                # logging.info("Epoch {} Batch {}:".format(epoch + 1, i + 1))
+                # logging.info('\tLoss/Sample: %.3f' % (loss.item()))
+            
+            y_true_all.append(data['y'])
+            y_prob_all.append(y_prob.cpu())
 
         # Print stats at the end of the epoch
         # num_batches = len(train_dl)
@@ -269,52 +205,76 @@ def training_loop(train_dl, val_dl, model, loss_fn, optimizer, scheduler, num_ep
         avg_loss = running_loss / len(train_dl.dataset)
         acc = correct_prediction/total_prediction
 
+        y_true_all = torch.cat(y_true_all, dim = 0).detach().cpu().numpy()
+        y_prob_all = torch.cat(y_prob_all, dim = 0).detach().cpu().numpy()
+
+        # auc = roc_auc_score(y_true_all, y_prob_all, multi_class="ovr", average='weighted')
+        auc = roc_auc_score(y_true_all, y_prob_all[:,1], average='weighted')
+
         logging.info("---------Epoch {}---------".format(epoch + 1))
         logging.info("Train Stats:")
-        logging.info(f'\tLoss: {avg_loss:.2f}, Accuracy: {acc:.2f}')
+        logging.info(f'\tLoss: {avg_loss:.2f}, Accuracy: {acc:.2f}, Auc: {auc:.2f}')
 
-        val_ret = validation_loop(val_dl, model, val=True, loss_fn=loss_fn)
+        all_train_loss.append(avg_loss)
+        all_train_acc.append(acc)
+        all_train_auc.append(auc)
 
-        logging.info("Validation Stats:")
-        logging.info(f'\tLoss: {val_ret["loss"]:.2f}, Accuracy: {val_ret["acc"]:.2f}, Auc: {val_ret["auc"]:.2f}\n')
+        if len(val_dl) > 0:
+            val_ret = validation_loop(val_dl, model, epoch, val=True, loss_fn=loss_fn)
 
-        if show_plot:
-            all_train_loss.append(avg_loss)
-            all_train_acc.append(acc)
+            logging.info("Validation Stats:")
+            logging.info(f'\tLoss: {val_ret["loss"]:.2f}, Accuracy: {val_ret["acc"]:.2f}, Auc: {val_ret["auc"]:.2f}\n')
+
             all_val_loss.append(val_ret["loss"])
             all_val_acc.append(val_ret["acc"])
             all_val_auc.append(val_ret["auc"])
-
-    if show_plot:
-        logging.info("Overall Result across epochs: ")
-        logging.info("Train: ")
-        logging.info("\ttrain_loss: {}".format(",".join(map(str, all_train_loss))))
-        logging.info("\ttrain_acc: {}".format(",".join(map(str, all_train_acc))))
-
-        logging.info("Val: ")
-        logging.info("\tval_loss: {}".format(",".join(map(str, all_val_loss))))
-        logging.info("\tval_acc: {}".format(",".join(map(str, all_val_acc))))
-        logging.info("\tval_auc: {}".format(",".join(map(str, all_val_auc))))
-
-        all_ret = [all_train_loss, all_train_acc, all_val_loss, all_val_acc, all_val_auc]
-        titles = ["all_train_loss", "all_train_acc", "all_val_loss", "all_val_acc", "all_val_auc"]
         
-        for title, ret in zip(titles, all_ret):
-            plot_result(title, ret)
-
     logging.info('Finished Training\n')
 
-    return model
+    result = {"all_train_loss": all_train_loss, "all_train_acc": all_train_acc, "all_train_auc": all_train_auc, "all_val_loss": all_val_loss, "all_val_acc": all_val_acc, "all_val_auc": all_val_auc}
+
+    return model, result
 
 def plot_result(title, nums):
     plt.plot(np.arange(1, len(nums) + 1), nums)
     plt.title(title)
     plt.xlabel("epochs")
     plt.ylabel("val")
+    plt.axhline(y=max(nums), color='r', linestyle='-', label="max={}".format(round(max(nums), 4)))
+    plt.axhline(y=min(nums), color='g', linestyle='-', label="min={}".format(round(min(nums), 4)))
+    plt.legend()
+
     plt.savefig(os.path.join(logging_dir, title + ".jpg"))
     plt.close()
 
-def validation_loop(val_dl, model, val=True, loss_fn=None):
+
+def plot(result):
+    all_train_loss, all_train_acc, all_train_auc, all_val_loss, all_val_acc, all_val_auc = \
+        result["all_train_loss"], result["all_train_acc"], result["all_train_auc"], result["all_val_loss"], result["all_val_acc"], result["all_val_auc"]
+
+    logging.info("Overall Result across epochs: ")
+    logging.info("Train: ")
+    logging.info("\ttrain_loss: {}".format(",".join(map(str, all_train_loss))))
+    logging.info("\ttrain_acc: {}".format(",".join(map(str, all_train_acc))))
+    logging.info("\ttrain_auc: {}".format(",".join(map(str, all_train_auc))))
+
+    logging.info("Val: ")
+    logging.info("\tval_loss: {}".format(",".join(map(str, all_val_loss))))
+    logging.info("\tval_acc: {}".format(",".join(map(str, all_val_acc))))
+    logging.info("\tval_auc: {}".format(",".join(map(str, all_val_auc))))
+
+    all_ret = [all_train_loss, all_train_acc, all_train_auc, all_val_loss, all_val_acc, all_val_auc]
+    titles = ["all_train_loss", "all_train_acc", "all_train_auc", "all_val_loss", "all_val_acc", "all_val_auc"]
+    for title, ret in zip(titles, all_ret):
+        plot_result(title, ret)
+
+
+def validation_loop(val_dl, model, epoch=0, val=True, loss_fn=None):
+    if val:
+        print("Validation starts")
+    else:
+        print("Test starts")
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     size = len(val_dl.dataset)
 
@@ -324,8 +284,6 @@ def validation_loop(val_dl, model, val=True, loss_fn=None):
 
     with torch.no_grad(): 
         for i, data in enumerate(val_dl):
-            if i % 100 == 0:
-                logging.info("batch {}".format(i))
             if val:
                 x, y_true = data['x'].to(device), data['y'].to(device).reshape(-1)
             else:
@@ -344,6 +302,7 @@ def validation_loop(val_dl, model, val=True, loss_fn=None):
             _, y_pred = torch.max(outputs, 1)
 
             y_prob_all.append(y_prob.cpu())
+            y_pred_all.append(y_pred.cpu())
 
             if val:
                 val_loss += loss_fn(outputs, y_true).item()
@@ -352,9 +311,6 @@ def validation_loop(val_dl, model, val=True, loss_fn=None):
                 correct_prediction += (y_pred == y_true).sum().item()
                 total_prediction += y_pred.shape[0]
                 y_true_all.append(y_true.cpu())
-
-            else:
-                y_pred_all.append(y_pred.cpu())
     
     # oh_ytrue = torch.nn.functional.one_hot(y_true)
     # y_prob = torch.nn.functional.softmax(outputs, dim=1).detach().numpy()
@@ -362,76 +318,132 @@ def validation_loop(val_dl, model, val=True, loss_fn=None):
 
     # y_prob = torch.nn.functional.softmax(outputs, dim=1)
     y_prob_all = torch.cat(y_prob_all, dim = 0).detach().cpu().numpy()
+    y_pred_all = torch.cat(y_pred_all, dim = 0).detach().cpu().numpy()
+
     if val:
         acc = correct_prediction/total_prediction
         y_true_all = torch.cat(y_true_all, dim = 0).detach().cpu().numpy()
         
-        auc = roc_auc_score(y_true_all, y_prob_all, multi_class="ovr", average='weighted')
+        # auc = roc_auc_score(y_true_all, y_prob_all, multi_class="ovr", average='weighted')
+        auc = roc_auc_score(y_true_all, y_prob_all[:,1], average='weighted')
+
+        logging.info("Confusion Matrix: ")
+        print("Confusion Matrix: ")
+
+        cm = confusion_matrix(y_true_all, y_pred_all)
+        print("{}".format(cm))
+        logging.info("{}".format(cm))
+
+        if epoch > 12:
+            cm_summary(cm)
+
+        print("")
+        logging.info("")
+
         return {"acc": acc, "loss": val_loss / size, "auc": auc}
     else:
-        y_pred_all = torch.cat(y_pred_all, dim = 0).detach().cpu().numpy()
         return {"pred": y_pred_all, "prob": y_prob_all, "filenames": filenames}
 
+def cm_summary(cm):
+    for i, row in enumerate(cm):
+        print("Label {}".format(i))
+        print("Accuracy: {}".format(round(row[i] / np.sum(row), 4)))
+        print("Most likely confused with label {}\n".format(row.argsort()[-2]))
+        
+        logging.info("Label {}".format(i))
+        logging.info("Accuracy: {}".format(round(row[i] / np.sum(row), 4)))
+        logging.info("Most likely confused with label {}\n".format(row.argsort()[-2]))
+
 def main():
-    global time
-    time = datetime.now().strftime('%m%d%H%M')
+    all_configs = get_configs()
 
-    global logging_dir
-    logging_dir = os.path.join("logging", time)
-    if not os.path.exists(logging_dir):
-        os.makedirs(logging_dir)
+    for i, configs in enumerate(all_configs):
+        print("{} config".format(i + 1))
+        global time
+        time = datetime.now().strftime('%m%d%H%M')
 
-    logging.basicConfig(format='%(message)s', filemode='w', filename=os.path.join(logging_dir, 'logging.log'), encoding='utf-8', level=logging.INFO)
-    logging.info("Configs:")
-    logging.info(pformat(configs))
-    logging.info("")
+        global logging_dir
+        logging_dir = os.path.join("logging", time)
+        if not os.path.exists(logging_dir):
+            os.makedirs(logging_dir)
 
-    train_audio_path = configs["path_config"]["train_audio_path"]
-    metadata = pd.read_csv("./train/meta_train.csv")
+        logging.basicConfig(format='%(message)s', filemode='w', filename=os.path.join(logging_dir, 'logging.log'), encoding='utf-8', level=logging.INFO)
+        logging.info("Configs:")
+        logging.info(pformat(configs))
+        logging.info("")
 
-    run_eda = configs["general_config"]["run_eda"]
-    x_summary = explore_x(train_audio_path)
-    y_summary = explore_y(metadata, run_eda)
+        train_audio_path = configs["path_config"]["train_audio_path"]
+        metadata = pd.read_csv("./train/meta_train.csv")
+        
+        metadata["Remark_label"] = list(map(lambda x: remark2idx[x], metadata["Remark"]))
 
-    data = data_cleaning(train_audio_path, x_summary["waveform_shape"], metadata)
+        run_eda = configs["general_config"]["run_eda"]
+        x_summary = explore_x(train_audio_path)
+        y_summary = explore_y(metadata, run_eda)
 
-    audio_dataset = AudioDataset(train_audio_path, data["x_file_paths"], y=data["y"], label_name=configs["label_config"]["label_name"])
+        data = data_cleaning(train_audio_path, x_summary["waveform_shape"], metadata)
 
-    data = data_split(audio_dataset, configs["data_config"])
 
-    model = train(data, len(y_summary["label"]), configs["train_config"])
+        general_config = configs["general_config"]
+        scores = []
 
-    dir_path = os.path.join("model", time)# + ".pt" 
-    if not os.path.exists(dir_path):
-        os.makedirs(dir_path)
+        for pass_id in range(general_config["n_pass"]):
+            logging.info("--------------Pass {}--------------".format(pass_id + 1))
+            print("--------------Pass {}--------------".format(pass_id + 1))
+            audio_dataset = AudioDataset(train_audio_path, data["x_file_paths"], configs["preprocess_config"], y=data["y"], label_name=configs["label_config"]["label_name"])
 
-    torch.save(model.state_dict(), os.path.join(dir_path, "model.pt"))
+            data_dl = to_dataloader(audio_dataset, configs["data_config"])
 
-    test_audio_path = configs["path_config"]["test_audio_path"]
-    
-    test_files = os.listdir(test_audio_path)
-    test_ds = AudioDataset(test_audio_path, test_files)
-    test_dl = DataLoader(test_ds, batch_size=128, shuffle=False, num_workers=0)
+            model, result = train(data_dl, configs["train_config"])
 
-    test_ret = validation_loop(test_dl, model, val=False)
+            if configs["data_config"]["train_perc"] < 1:
+                if configs["train_config"]["show_plot"]:
+                    plot(result)
+                
+                scores.append(result["all_val_auc"][-1])
 
-    y_prob_all = test_ret["prob"]
-    filenames = np.array([test_ret["filenames"]])
+        criteria = general_config["score_criteria"]
 
-    col_name = ["Filename", "Barking", "Howling", "Crying", "COSmoke", "GlassBreaking", "Other"]
+        if configs["data_config"]["train_perc"] < 1:
+            logging.info("Scoring criteria: {}".format(criteria))
+            logging.info("\t{}".format(scores))
 
-    sample = pd.read_csv(os.path.join("pred", "sample_submission.csv"))
-    output = np.concatenate((filenames.T, y_prob_all), axis=1)
-    output = pd.DataFrame(output, columns=col_name)
-    output = output.append(sample.iloc[10000:], ignore_index=True)
+            final_score = round(sum(scores) / len(scores), 4)
+            logging.info("Final Score: {}".format(final_score))
 
-    pred_dir = os.path.join("pred", time)
-    if not os.path.exists(pred_dir):
-        os.makedirs(pred_dir)
-    output.to_csv(os.path.join(pred_dir, "pred.csv"), index=False)
+        summary(model, (configs["model_config"]["num_channel"], 64, 79))
+
+        dir_path = os.path.join("model", time) 
+        if not os.path.exists(dir_path):
+            os.makedirs(dir_path)
+        torch.save(model.state_dict(), os.path.join(dir_path, "model.pt"))
+
+        if configs["general_config"]["do_test"]:
+            test_audio_path = configs["path_config"]["test_audio_path"]
+            test_files = os.listdir(test_audio_path)
+            test_ds = AudioDataset(test_audio_path, test_files, configs["preprocess_config"])
+            test_dl = DataLoader(test_ds, batch_size=configs["data_config"]["test_batch_size"], shuffle=False, num_workers=0)
+
+            test_ret = validation_loop(test_dl, model, val=False)
+
+            y_prob_all = test_ret["prob"]
+            filenames = np.array([test_ret["filenames"]])
+
+            col_name = ["Filename", "Barking", "Howling", "Crying", "COSmoke", "GlassBreaking", "Other"]
+
+            sample = pd.read_csv(os.path.join("pred", "sample_submission.csv"))
+            output = np.concatenate((filenames.T, y_prob_all), axis=1)
+            output = pd.DataFrame(output, columns=col_name)
+            output = output.sort_values(by=["Filename"])
+            output = output.append(sample.iloc[10000:], ignore_index=True)
+
+            pred_dir = os.path.join("pred", time)
+            if not os.path.exists(pred_dir):
+                os.makedirs(pred_dir)
+            output.to_csv(os.path.join(pred_dir, "pred.csv"), index=False)
 
     # Load Model
-    # model = AudioClassifier(6)
+    # model = AudioClassifier(6, config["model_config"])
     # model.load_state_dict(torch.load("model/05292344.pt"))
     # model.eval()
     # output = pd.read_csv("prediction1.csv")
@@ -442,5 +454,14 @@ def main():
 
 if __name__ == "__main__":
     main()
-    # metadata = pd.read_csv("./train/meta_train.csv")
-    # explore_y(metadata)
+    # output = pd.read_csv("pred/05302216/pred.csv")
+    # output = output.iloc[:10000].sort_values(by=["Filename"])
+
+    # sample = pd.read_csv(os.path.join("pred", "sample_submission.csv"))
+    # output = output.append(sample.iloc[10000:], ignore_index=True)
+    # output = output.to_csv("prediction.csv", index=False)
+
+    # output = pd.read_csv("prediction1.csv")
+    # sample = pd.read_csv("sample_submission.csv")
+    # output = output.append(sample.iloc[10000:], ignore_index=True)
+    # output.to_csv("prediction.csv", index=False)
