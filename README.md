@@ -1,26 +1,26 @@
 # T-Brain Furbo Dog Sound Classification Competition
 
 ### Final Score
-    53th/301 
-    Get 0.960740 final auc score, on private dataset. (First place: 0.989945)
+53th/301  
+Get 0.960740 final auc score, on private dataset. (First place: 0.989945)
 
 ### Trials (w/ Public Score)
-**1. Plain approach - Score 0.9549**
+**1. Plain approach - Score 0.9549**  
 Take the melspectrogram of the input audio and then feed it to CNN models. Have tune the parameters such that the highest possible public auc is aound 0.95, while 0.98 on validation set.
 
-**2. Data Augmentation - Score 0.9618** 
+**2. Data Augmentation - Score 0.9618**  
 Try different ways (time_shift, add_white_noise, time_stretch, spec_aug) to augment the data (online data augmentation). Only a minor improve in the auc score.
  
-**3. Two models - Score 0.8812**
+**3. Two models - Score 0.8812**  
 Given the above result, `label 0, 1, 2`, have the worse prediction accuracy (often mix with each other). Hence, I try to first predict 6 classes. If pred falls into `label 0, 1, 2`, then go over another model only for `label 0, 1, 2` 3-class classification. The 3-class model, however, does not show a huge improvement in auc. 
 
-**4. Try to do the 11-class classification - Score Around 0.89**
+**4. Try to do the 11-class classification - Score Around 0.89**  
 Multiclass classification based on the `label` provided in the `remark` column. Then after predictions, every prediction from group 5 - 10 will be labelled as group 5 -> Quite difficult to learn the info of group 5 - 10 sample because those groups have very small samples.
 
-**5. Remove insignificant samples - Score Around 0.95**
+**5. Remove insignificant samples - Score Around 0.95**  
 Remove samples with too many empty values (no sound). Threshold values tried (0.3, 0.35, 0.4, 0.5). No improvement
 
-**6. Transformer - Score 0.7315**
+**6. Transformer - Score 0.7315**  
 Parameters do not really move/learn. Haven't yet successfully tune the model such that its gradient won't vanish. Lack of time
 
 ### TODOs
