@@ -1,6 +1,7 @@
 path_config = {
     "train_audio_path": "./train/train",
-    "test_audio_path": "./public_test",
+    "test_audio_path_public": "./public_test",
+    "test_audio_path_private": "./private_test",
 }
 
 label_config = {
@@ -9,24 +10,24 @@ label_config = {
 
 model_config = {
     "num_channel": 1,
-    "conv1_channel": 16,
-    "conv2_channel": 32,
-    "conv3_channel": None,
-    "conv4_channel": None,
+    "conv1_channel": 8,
+    "conv2_channel": 16,
+    "conv3_channel": 32,
+    "conv4_channel": 64,
 }
 
 train_config = {
-    "num_epochs": 30,
+    "num_epochs": 20,
     "optimizer": "adam",
-    "lr": 0.005,
-    "max_lr": 0.02,
+    "lr": 0.001,
+    "max_lr": 0.01,
     "show_plot": True,
     "model_config": model_config,
 }
 
 data_config = {
-    "train_perc": 0.7,
-    "train_batch_size": 32,
+    "train_perc": 0.75,
+    "train_batch_size": 64,
     "val_batch_size": 128,
     "test_batch_size": 128,
 }
@@ -39,8 +40,8 @@ preprocess_config = {
 general_config = {
     "run_eda": False,
     "score_criteria": "all_val_auc",
-    "n_pass": 3,
-    "do_test": False,
+    "n_pass": 1,
+    "do_test": True,
 }
 
 idx2label = {

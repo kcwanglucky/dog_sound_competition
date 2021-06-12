@@ -6,7 +6,7 @@ import torch
 from torch import nn
 import logging
 
-from torch.utils.data import DataLoader, dataset
+from torch.utils.data import DataLoader
 from IPython.display import Audio, display
 from torchsummary import summary
 
@@ -16,7 +16,7 @@ from torch.utils.data import random_split
 from datetime import datetime
 
 from utils import *
-from model import AudioClassifier
+from model import AudioClassifier, AudioClassifierCNNGRU
 from audio_util import AudioDataset, AudioProcessor
 from config import configs, get_configs, remark2idx
 from pprint import pformat
@@ -54,27 +54,31 @@ def data_cleaning(path_to_train_dir, shape, metadata):
 
     num_files_bf = len(files)
     to_remove = set()  # collect samples whose shape is different from input `shape`
-    count = 0
 
     other_files = [f + ".wav" for f in metadata[metadata["Remark"] == "Other"]["Filename"].values]
 
     for path in other_files:
         to_remove.add(path)
-        count += 1
 
     for path in files:
         # print(os.path.join(TRAIN_AUDIO_PATH, path))
         waveform, sample_rate = AudioProcessor.read(os.path.join(path_to_train_dir, path))
-        if waveform.shape != shape:
+        if np.sum(waveform == 0) / len(waveform) > 0.5:
             to_remove.add(path)
-            count += 1
-            logging.info("Anomaly Shape Detected: {}\nShape: {}\n".format(path, waveform.shape))
+
+    #     if waveform.shape != shape:
+    #         to_remove.add(path)
+    #         count += 1
+    #         logging.info("Anomaly Shape Detected: {}\nShape: {}\n".format(path, waveform.shape))
 
         """ To remove Label 4, 5, 6 so that I could train a model for label 1, 2, 3"""
         #TODO: Make it flexible
-        if metadata[metadata["Filename"] == path.split('.')[0]]["Label"].values[0] not in (1, 2):
-            if path not in to_remove:
-                to_remove.add(path)
+        # if metadata[metadata["Filename"] == path.split('.')[0]]["Label"].values[0] not in (0, 1, 2):
+        # if metadata[metadata["Filename"] == path.split('.')[0]]["Label"].values[0] not in (3, 4, 5):
+        #     if path not in to_remove:
+        #         to_remove.add(path)
+
+    to_remove.add("train_01046.wav")    # Have an anomaly shape
 
     for file in to_remove:
         drop_idx = metadata[metadata["Filename"] == file.split('.')[0]].index
@@ -82,11 +86,13 @@ def data_cleaning(path_to_train_dir, shape, metadata):
         files.remove(file)
 
     #TODO: Make it flexible
-    metadata = metadata.loc[metadata['Label'].isin([1, 2])]
-    metadata["Label"] = metadata["Label"] - 1
+    # metadata = metadata.loc[metadata['Label'].isin([0, 1, 2])]
+    # metadata["Label"] = metadata["Label"]
+    # metadata = metadata.loc[metadata['Label'].isin([3, 4, 5])]
+    # metadata["Label"] = metadata["Label"] - 3
     
     assert len(metadata) == len(files)
-    logging.info("Total Anomaly: {}".format(count))
+    logging.info("Total Anomaly: {}".format(len(to_remove)))
     logging.info("Before deleting anomaly: {} numbers of audios".format(num_files_bf))
     logging.info("After deleting anomaly: {} numbers of audios\n".format(len(files)))
 
@@ -97,6 +103,7 @@ def data_cleaning(path_to_train_dir, shape, metadata):
     return {"x_file_paths": files, "y": metadata}
 
 def to_dataloader(dataset, config):
+    "transform Dataset to Dataloader and perform train test split"
     num_items = len(dataset)
     num_train = round(num_items * config["train_perc"])
     num_val = num_items - num_train
@@ -129,12 +136,21 @@ def train(data, config):
 
     model_config = config["model_config"]
     model = AudioClassifier(num_class, model_config)
+    print(summary(model, (1, 64, 201)))
+    # model = AudioClassifierCNNGRU(n_cnn_layers=2, n_rnn_layers=1, rnn_dim=16, n_class=6, n_feats=64)
+
     device = torch.device(device)
     model = model.to(device)
 
     # Loss Function, Optimizer and Scheduler
-    loss_fnc = torch.nn.CrossEntropyLoss()
+    weights = torch.tensor([2., 5., 5., 1., 1., 2.])
+    loss_fnc = torch.nn.CrossEntropyLoss(weights)
+
+    # loss_fnc = torch.nn.CrossEntropyLoss()
+
+    # loss_fnc = torch.nn.MultiMarginLoss(weight=weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"])
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"], betas=(0.9, 0.999), eps=1e-08)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, config["max_lr"],
                                                 steps_per_epoch=int(len(train_dl)),
                                                 epochs=config["num_epochs"],
@@ -208,8 +224,12 @@ def training_loop(train_dl, val_dl, model, loss_fn, optimizer, scheduler, num_ep
         y_true_all = torch.cat(y_true_all, dim = 0).detach().cpu().numpy()
         y_prob_all = torch.cat(y_prob_all, dim = 0).detach().cpu().numpy()
 
-        # auc = roc_auc_score(y_true_all, y_prob_all, multi_class="ovr", average='weighted')
-        auc = roc_auc_score(y_true_all, y_prob_all[:,1], average='weighted')
+        # TODO:
+        num_class = y_prob_all.shape[1]
+        if num_class > 2:
+            auc = roc_auc_score(y_true_all, y_prob_all, multi_class="ovr", average='weighted')
+        else:
+            auc = roc_auc_score(y_true_all, y_prob_all[:,1], average='weighted')
 
         logging.info("---------Epoch {}---------".format(epoch + 1))
         logging.info("Train Stats:")
@@ -270,11 +290,6 @@ def plot(result):
 
 
 def validation_loop(val_dl, model, epoch=0, val=True, loss_fn=None):
-    if val:
-        print("Validation starts")
-    else:
-        print("Test starts")
-
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     size = len(val_dl.dataset)
 
@@ -324,8 +339,12 @@ def validation_loop(val_dl, model, epoch=0, val=True, loss_fn=None):
         acc = correct_prediction/total_prediction
         y_true_all = torch.cat(y_true_all, dim = 0).detach().cpu().numpy()
         
-        # auc = roc_auc_score(y_true_all, y_prob_all, multi_class="ovr", average='weighted')
-        auc = roc_auc_score(y_true_all, y_prob_all[:,1], average='weighted')
+        # TODO:
+        num_class = y_prob_all.shape[1]
+        if num_class > 2:
+            auc = roc_auc_score(y_true_all, y_prob_all, multi_class="ovr", average='weighted')
+        else:
+            auc = roc_auc_score(y_true_all, y_prob_all[:,1], average='weighted')
 
         logging.info("Confusion Matrix: ")
         print("Confusion Matrix: ")
@@ -354,6 +373,149 @@ def cm_summary(cm):
         logging.info("Accuracy: {}".format(round(row[i] / np.sum(row), 4)))
         logging.info("Most likely confused with label {}\n".format(row.argsort()[-2]))
 
+def test(model, configs, time):
+    print("Test starts")
+
+    test_audio_path_public = configs["path_config"]["test_audio_path_public"]
+    test_files = os.listdir(test_audio_path_public)
+    
+    test_ds = AudioDataset(test_audio_path_public, test_files, configs["preprocess_config"])
+    test_dl = DataLoader(test_ds, batch_size=configs["data_config"]["test_batch_size"], shuffle=False, num_workers=0)
+    test_ret = validation_loop(test_dl, model, val=False)
+
+    y_prob_all = test_ret["prob"]
+    filenames = np.array([test_ret["filenames"]])
+
+    col_name = ["Filename", "Barking", "Howling", "Crying", "COSmoke", "GlassBreaking", "Other"]
+
+    # sample = pd.read_csv(os.path.join("pred", "sample_submission.csv"))
+    output = np.concatenate((filenames.T, y_prob_all), axis=1)
+    output = pd.DataFrame(output, columns=col_name)
+    output = output.sort_values(by=["Filename"])
+
+    test_audio_path_private = configs["path_config"]["test_audio_path_private"]
+    test_files = os.listdir(test_audio_path_private)
+
+    test_ds = AudioDataset(test_audio_path_private, test_files, configs["preprocess_config"])
+    test_dl = DataLoader(test_ds, batch_size=configs["data_config"]["test_batch_size"], shuffle=False, num_workers=0)
+    test_ret = validation_loop(test_dl, model, val=False)
+
+    y_prob_all = test_ret["prob"]
+    filenames = np.array([test_ret["filenames"]])
+
+    private_output = np.concatenate((filenames.T, y_prob_all), axis=1)
+    private_output = pd.DataFrame(private_output, columns=col_name)
+    private_output = private_output.sort_values(by=["Filename"])
+
+    output = output.append(private_output, ignore_index=True)
+
+    pred_dir = os.path.join("pred", time)
+    if not os.path.exists(pred_dir):
+        os.makedirs(pred_dir)
+    output.to_csv(os.path.join(pred_dir, "pred.csv"), index=False)
+
+def transform_metadata(metadata):
+    """ Transform the Labelling method to accommodate different prediction requirement """
+    # TODO:
+    # label = metadata["Label"].values
+    # label_n = np.array(list(map(lambda x: 0 if x in (0, 1, 2) else 1, label)))
+    # metadata["Label"] = label_n
+    return metadata
+
+def two_phase_test():
+    time = datetime.now().strftime('%m%d%H%M')
+
+    test_audio_path = configs["path_config"]["test_audio_path"]
+    test_files = os.listdir(test_audio_path)
+    test_ds = AudioDataset(test_audio_path, test_files, configs["preprocess_config"])
+    test_dl = DataLoader(test_ds, batch_size=configs["data_config"]["test_batch_size"], shuffle=False, num_workers=0)
+
+    two_test_ret = two_phase_loop(test_dl)
+
+    y_prob_all = two_test_ret["prob"]
+    filenames = np.array([two_test_ret["filenames"]])
+
+    col_name = ["Filename", "Barking", "Howling", "Crying", "COSmoke", "GlassBreaking", "Other"]
+
+    sample = pd.read_csv(os.path.join("pred", "sample_submission.csv"))
+    output = np.concatenate((filenames.T, y_prob_all), axis=1)
+    output = pd.DataFrame(output, columns=col_name)
+    output = output.sort_values(by=["Filename"])
+    output = output.append(sample.iloc[10000:], ignore_index=True)
+
+    pred_dir = os.path.join("pred", time)
+    if not os.path.exists(pred_dir):
+        os.makedirs(pred_dir)
+    output.to_csv(os.path.join(pred_dir, "pred.csv"), index=False)
+
+def two_phase_loop(test_dl):
+    model1 = AudioClassifier(2, configs["model_config"])
+    model1.load_state_dict(torch.load(os.path.join("model", "06071726/model_0.pt")))
+    model1.eval()
+
+    model2 = AudioClassifier(3, configs["model_config"])
+    model2.load_state_dict(torch.load(os.path.join("model", "06071801/model_0.pt")))
+    model2.eval()
+
+    model3 = AudioClassifier(3, configs["model_config"])
+    model3.load_state_dict(torch.load(os.path.join("model", "06071828/model_0.pt")))
+    model3.eval()
+
+    print("Test starts")
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    size = len(test_dl.dataset)
+
+    y_true_all, y_pred_all, y_prob_all = [], [], []
+    filenames = []
+
+    with torch.no_grad(): 
+        for i, data in enumerate(test_dl):
+            x = data['x'].to(device)
+            filenames.extend(data['filename'])
+
+            # Normalize the inputs
+            # mean, std = x.mean(), x.std()
+            # x = (x - mean) / std
+
+            # forward + backward + optimize
+            outputs = model1(x)
+            # y_prob = torch.nn.functional.softmax(outputs, dim=1)
+            y_prob = []
+
+            for i, output in enumerate(outputs):
+                if output[0] > output[1]:
+                    # Label 0, 1, 2
+                    temp = model2(x[i].unsqueeze(0))
+                    temp = torch.nn.functional.softmax(temp, dim=1)
+                    temp = nn.functional.pad(input=temp, pad=(0, 3, 0, 0), mode='constant', value=0)
+                else:
+                    # Label 3, 4, 5
+                    temp = model3(x[i].unsqueeze(0))
+                    temp = torch.nn.functional.softmax(temp, dim=1)
+                    temp = nn.functional.pad(input=temp, pad=(3, 0, 0, 0), mode='constant', value=0)
+                
+                y_prob.append(temp.cpu())
+            
+            y_prob = torch.cat(y_prob, dim = 0)
+
+            # Get the predicted class with the highest score
+            _, y_pred = torch.max(outputs, 1)
+
+            y_prob_all.append(y_prob.cpu())
+            y_pred_all.append(y_pred.cpu())
+    
+    # oh_ytrue = torch.nn.functional.one_hot(y_true)
+    # y_prob = torch.nn.functional.softmax(outputs, dim=1).detach().numpy()
+    # auc = roc_auc_score(oh_ytrue, y_prob, multi_class="ovr", average='weighted')
+
+    # y_prob = torch.nn.functional.softmax(outputs, dim=1)
+    y_prob_all = torch.cat(y_prob_all, dim = 0).detach().cpu().numpy()
+    y_pred_all = torch.cat(y_pred_all, dim = 0).detach().cpu().numpy()
+    
+    return {"pred": y_pred_all, "prob": y_prob_all, "filenames": filenames}
+
+
 def main():
     all_configs = get_configs()
 
@@ -374,6 +536,8 @@ def main():
 
         train_audio_path = configs["path_config"]["train_audio_path"]
         metadata = pd.read_csv("./train/meta_train.csv")
+
+        metadata = transform_metadata(metadata)
         
         metadata["Remark_label"] = list(map(lambda x: remark2idx[x], metadata["Remark"]))
 
@@ -396,6 +560,11 @@ def main():
 
             model, result = train(data_dl, configs["train_config"])
 
+            dir_path = os.path.join("model", time) 
+            if not os.path.exists(dir_path):
+                os.makedirs(dir_path)
+            torch.save(model.state_dict(), os.path.join(dir_path, "model_{}.pt".format(pass_id)))
+
             if configs["data_config"]["train_perc"] < 1:
                 if configs["train_config"]["show_plot"]:
                     plot(result)
@@ -411,36 +580,10 @@ def main():
             final_score = round(sum(scores) / len(scores), 4)
             logging.info("Final Score: {}".format(final_score))
 
-        summary(model, (configs["model_config"]["num_channel"], 64, 79))
-
-        dir_path = os.path.join("model", time) 
-        if not os.path.exists(dir_path):
-            os.makedirs(dir_path)
-        torch.save(model.state_dict(), os.path.join(dir_path, "model.pt"))
+        # summary(model, (configs["model_config"]["num_channel"], 64, 79))
 
         if configs["general_config"]["do_test"]:
-            test_audio_path = configs["path_config"]["test_audio_path"]
-            test_files = os.listdir(test_audio_path)
-            test_ds = AudioDataset(test_audio_path, test_files, configs["preprocess_config"])
-            test_dl = DataLoader(test_ds, batch_size=configs["data_config"]["test_batch_size"], shuffle=False, num_workers=0)
-
-            test_ret = validation_loop(test_dl, model, val=False)
-
-            y_prob_all = test_ret["prob"]
-            filenames = np.array([test_ret["filenames"]])
-
-            col_name = ["Filename", "Barking", "Howling", "Crying", "COSmoke", "GlassBreaking", "Other"]
-
-            sample = pd.read_csv(os.path.join("pred", "sample_submission.csv"))
-            output = np.concatenate((filenames.T, y_prob_all), axis=1)
-            output = pd.DataFrame(output, columns=col_name)
-            output = output.sort_values(by=["Filename"])
-            output = output.append(sample.iloc[10000:], ignore_index=True)
-
-            pred_dir = os.path.join("pred", time)
-            if not os.path.exists(pred_dir):
-                os.makedirs(pred_dir)
-            output.to_csv(os.path.join(pred_dir, "pred.csv"), index=False)
+            test(model, configs, time)
 
     # Load Model
     # model = AudioClassifier(6, config["model_config"])
@@ -454,14 +597,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    # output = pd.read_csv("pred/05302216/pred.csv")
-    # output = output.iloc[:10000].sort_values(by=["Filename"])
-
-    # sample = pd.read_csv(os.path.join("pred", "sample_submission.csv"))
-    # output = output.append(sample.iloc[10000:], ignore_index=True)
-    # output = output.to_csv("prediction.csv", index=False)
-
-    # output = pd.read_csv("prediction1.csv")
-    # sample = pd.read_csv("sample_submission.csv")
-    # output = output.append(sample.iloc[10000:], ignore_index=True)
-    # output.to_csv("prediction.csv", index=False)
+    # two_phase_test()
